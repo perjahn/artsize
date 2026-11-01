@@ -8,15 +8,17 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
-	"unicode"
 
+	"github.com/goccy/go-yaml"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -31,39 +33,70 @@ type repositorySummary struct {
 	UsedSpaceInBytes json.Number `json:"usedSpaceInBytes"`
 }
 
-type aqlSearchResult struct {
-	Results []aqlRootFolder `json:"results"`
-}
-
-type aqlRootFolder struct {
-	Repository string        `json:"repo"`
-	Properties []aqlProperty `json:"properties"`
-}
-
-type aqlProperty struct {
-	Key   string `json:"key"`
-	Value string `json:"value"`
-}
-
 type artifactoryTargetConfig struct {
-	URL      string `json:"url"`
-	Server   string `json:"server"`
-	Token    string `json:"token"`
-	TokenEnv string `json:"tokenEnv"`
-	Username string `json:"username"`
-	Password string `json:"password"`
+	Url                       string `json:"url"`
+	Server                    string `json:"server"`
+	Token                     string `json:"token"`
+	TokenEnv                  string `json:"tokenEnv"`
+	Username                  string `json:"username"`
+	Password                  string `json:"password"`
+	PasswordEnv               string `json:"passwordEnv"`
+	MetadataUrl               string `json:"metadataUrl"`
+	MetadataGroupKey          string `json:"metadataGroupKey"`
+	MetadataCacheVersionUrl   string `json:"metadataCacheVersionUrl"`
+	MetadataCacheVersionField string `json:"metadataCacheVersionField"`
+	MetadataToken             string `json:"metadataToken"`
+	MetadataTokenEnv          string `json:"metadataTokenEnv"`
+	MetadataUsername          string `json:"metadataUsername"`
+	MetadataPassword          string `json:"metadataPassword"`
+	MetadataPasswordEnv       string `json:"metadataPasswordEnv"`
+}
+
+type targetCredentials struct {
+	token       string
+	tokenEnv    string
+	username    string
+	password    string
+	passwordEnv string
+}
+
+type repositoryGroupValueCache struct {
+	mu       sync.Mutex
+	enabled  bool
+	revision string
+	values   map[string]string
+	stats    repositoryCacheStats
+}
+
+type repositoryCacheStats struct {
+	repositoriesSeen      uint64
+	repositoriesEligible  uint64
+	ungroupedRepositories uint64
+	versionChecks         uint64
+	hits                  uint64
+	misses                uint64
+	refreshes             uint64
+	metadataFetches       uint64
+	errors                uint64
 }
 
 type artifactoryClient struct {
 	baseUrl                 string
 	server                  string
-	propertyName            string
+	metadataUrlTemplate     string
+	metadataGroupKey        string
+	metadataCacheVersionUrl string
+	metadataCacheField      string
+	metadataToken           string
+	metadataUsername        string
+	metadataPassword        string
 	propertyGroupMetricName string
 	propertyValueLabelName  string
 	token                   string
 	username                string
 	password                string
 	http                    *http.Client
+	metadataCache           *repositoryGroupValueCache
 }
 
 type repositoryCollector struct {
@@ -88,10 +121,7 @@ func main() {
 	registry.MustRegister(newRepositoryCollector(clients))
 	mux := http.NewServeMux()
 	metricsHandler := promhttp.HandlerFor(registry, promhttp.HandlerOpts{})
-	mux.Handle("/metrics", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("Metrics endpoint scraped from %s", r.RemoteAddr)
-		metricsHandler.ServeHTTP(w, r)
-	}))
+	mux.Handle("/metrics", metricsHandler)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "ok\n")
@@ -101,7 +131,7 @@ func main() {
 	if addr == "" {
 		addr = ":9657"
 	}
-	server := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	server := &http.Server{Addr: addr, Handler: requestLoggingHandler(mux, clients), ReadHeaderTimeout: 5 * time.Second}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -119,10 +149,6 @@ func main() {
 }
 
 func newArtifactoryClients() ([]*artifactoryClient, error) {
-	propertyName := strings.TrimSpace(os.Getenv("ARTIFACTORY_PROPERTY_NAME"))
-	if propertyName == "" {
-		return nil, errors.New("ARTIFACTORY_PROPERTY_NAME is required")
-	}
 	propertyGroupMetricName := strings.TrimSpace(os.Getenv("ARTIFACTORY_PROPERTY_GROUP_SIZE_METRIC_NAME"))
 	if propertyGroupMetricName == "" {
 		propertyGroupMetricName = "artifactory_property_group_size_bytes"
@@ -141,63 +167,130 @@ func newArtifactoryClients() ([]*artifactoryClient, error) {
 	var targets []artifactoryTargetConfig
 	if configuredTargets := strings.TrimSpace(os.Getenv("ARTIFACTORY_TARGETS")); configuredTargets != "" {
 		if err := json.Unmarshal([]byte(configuredTargets), &targets); err != nil {
-			return nil, fmt.Errorf("ARTIFACTORY_TARGETS must be a JSON array: %w", err)
+			return nil, fmt.Errorf("ARTIFACTORY_TARGETS must be a json array: %w", err)
 		}
 		if len(targets) == 0 {
 			return nil, errors.New("ARTIFACTORY_TARGETS must contain at least one target")
 		}
 	} else {
-		targets = []artifactoryTargetConfig{{
-			URL:      os.Getenv("ARTIFACTORY_URL"),
-			Server:   os.Getenv("ARTIFACTORY_SERVER"),
-			Token:    os.Getenv("ARTIFACTORY_TOKEN"),
-			Username: os.Getenv("ARTIFACTORY_USERNAME"),
-			Password: os.Getenv("ARTIFACTORY_PASSWORD"),
-		}}
+		return nil, errors.New("ARTIFACTORY_TARGETS is required")
 	}
 
 	clients := make([]*artifactoryClient, 0, len(targets))
 	servers := make(map[string]struct{}, len(targets))
 	for index, target := range targets {
-		baseUrl := strings.TrimRight(strings.TrimSpace(target.URL), "/")
+		metadataUrlTemplate := strings.TrimSpace(target.MetadataUrl)
+		if metadataUrlTemplate == "" || !strings.Contains(metadataUrlTemplate, "{repo}") {
+			return nil, fmt.Errorf("artifactory target %d: metadataUrl is required and must contain {repo}", index+1)
+		}
+		metadataGroupKey := strings.TrimSpace(target.MetadataGroupKey)
+		if metadataGroupKey == "" {
+			return nil, fmt.Errorf("artifactory target %d: metadataGroupKey is required", index+1)
+		}
+		metadataCacheVersionUrl := strings.TrimSpace(target.MetadataCacheVersionUrl)
+		metadataCacheField := strings.TrimSpace(target.MetadataCacheVersionField)
+		if (metadataCacheVersionUrl == "") != (metadataCacheField == "") {
+			return nil, fmt.Errorf("artifactory target %d: metadataCacheVersionUrl and metadataCacheVersionField must be set together", index+1)
+		}
+		metadataCredentials, err := resolveTargetCredentials(index+1, "metadata", targetCredentials{
+			token:       target.MetadataToken,
+			tokenEnv:    target.MetadataTokenEnv,
+			username:    target.MetadataUsername,
+			password:    target.MetadataPassword,
+			passwordEnv: target.MetadataPasswordEnv,
+		})
+		if err != nil {
+			return nil, err
+		}
+		baseUrl := strings.TrimRight(strings.TrimSpace(target.Url), "/")
 		if baseUrl == "" {
-			return nil, fmt.Errorf("Artifactory target %d: url is required", index+1)
+			return nil, fmt.Errorf("artifactory target %d: url is required", index+1)
 		}
 		server := strings.TrimSpace(target.Server)
 		if server == "" {
 			server = baseUrl
 		}
 		if _, exists := servers[server]; exists {
-			return nil, fmt.Errorf("Artifactory target %d: server %q is duplicated", index+1, server)
+			return nil, fmt.Errorf("artifactory target %d: server %q is duplicated", index+1, server)
 		}
 		servers[server] = struct{}{}
-		if (target.Username == "") != (target.Password == "") {
-			return nil, fmt.Errorf("Artifactory target %d: username and password must be set together", index+1)
+		credentials, err := resolveTargetCredentials(index+1, "", targetCredentials{
+			token:       target.Token,
+			tokenEnv:    target.TokenEnv,
+			username:    target.Username,
+			password:    target.Password,
+			passwordEnv: target.PasswordEnv,
+		})
+		if err != nil {
+			return nil, err
 		}
-		token := target.Token
-		if tokenEnv := strings.TrimSpace(target.TokenEnv); tokenEnv != "" {
-			if token != "" {
-				return nil, fmt.Errorf("Artifactory target %d: set either token or tokenEnv, not both", index+1)
-			}
-			var exists bool
-			token, exists = os.LookupEnv(tokenEnv)
-			if !exists || token == "" {
-				return nil, fmt.Errorf("Artifactory target %d: token environment variable %q is unset or empty", index+1, tokenEnv)
-			}
-		}
+		metadataCache := &repositoryGroupValueCache{enabled: metadataCacheVersionUrl != ""}
 		clients = append(clients, &artifactoryClient{
 			baseUrl:                 baseUrl,
 			server:                  server,
-			propertyName:            propertyName,
+			metadataUrlTemplate:     metadataUrlTemplate,
+			metadataGroupKey:        metadataGroupKey,
+			metadataCacheVersionUrl: metadataCacheVersionUrl,
+			metadataCacheField:      metadataCacheField,
+			metadataToken:           metadataCredentials.token,
+			metadataUsername:        metadataCredentials.username,
+			metadataPassword:        metadataCredentials.password,
 			propertyGroupMetricName: propertyGroupMetricName,
 			propertyValueLabelName:  propertyValueLabelName,
-			token:                   token,
-			username:                target.Username,
-			password:                target.Password,
+			token:                   credentials.token,
+			username:                credentials.username,
+			password:                credentials.password,
 			http:                    &http.Client{Timeout: 15 * time.Second},
+			metadataCache:           metadataCache,
 		})
 	}
 	return clients, nil
+}
+
+func resolveTargetCredentials(targetNumber int, prefix string, configured targetCredentials) (targetCredentials, error) {
+	tokenField := credentialFieldName(prefix, "token")
+	tokenEnvField := credentialFieldName(prefix, "tokenEnv")
+	passwordField := credentialFieldName(prefix, "password")
+	passwordEnvField := credentialFieldName(prefix, "passwordEnv")
+
+	token, err := resolveCredentialValue(targetNumber, configured.token, configured.tokenEnv, tokenField, tokenEnvField)
+	if err != nil {
+		return targetCredentials{}, err
+	}
+	password, err := resolveCredentialValue(targetNumber, configured.password, configured.passwordEnv, passwordField, passwordEnvField)
+	if err != nil {
+		return targetCredentials{}, err
+	}
+	if (configured.username == "") != (password == "") {
+		return targetCredentials{}, fmt.Errorf("artifactory target %d: %s and %s must be set together", targetNumber, credentialFieldName(prefix, "username"), passwordField)
+	}
+	return targetCredentials{
+		token:    token,
+		username: configured.username,
+		password: password,
+	}, nil
+}
+
+func credentialFieldName(prefix, field string) string {
+	if prefix == "" {
+		return field
+	}
+	return prefix + strings.ToUpper(field[:1]) + field[1:]
+}
+
+func resolveCredentialValue(targetNumber int, value, envName, valueField, envField string) (string, error) {
+	envName = strings.TrimSpace(envName)
+	if envName == "" {
+		return value, nil
+	}
+	if value != "" {
+		return "", fmt.Errorf("artifactory target %d: set either %s or %s, not both", targetNumber, valueField, envField)
+	}
+	resolved, exists := os.LookupEnv(envName)
+	if !exists || resolved == "" {
+		return "", fmt.Errorf("artifactory target %d: %s environment variable %q is unset or empty", targetNumber, valueField, envName)
+	}
+	return resolved, nil
 }
 
 func (c *artifactoryClient) setAuthentication(req *http.Request) {
@@ -205,6 +298,14 @@ func (c *artifactoryClient) setAuthentication(req *http.Request) {
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	} else if c.username != "" {
 		req.SetBasicAuth(c.username, c.password)
+	}
+}
+
+func (c *artifactoryClient) setMetadataAuthentication(req *http.Request) {
+	if c.metadataToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.metadataToken)
+	} else if c.metadataUsername != "" {
+		req.SetBasicAuth(c.metadataUsername, c.metadataPassword)
 	}
 }
 
@@ -237,75 +338,214 @@ func (c *artifactoryClient) repositorySizes(ctx context.Context) ([]repositorySu
 	return summary.Repositories, nil
 }
 
-func (c *artifactoryClient) rootFolderPropertyValues(ctx context.Context) (map[string][]string, error) {
-	const rootFolderQuery = `items.find({"type":"folder","path":{"$eq":"."},"name":{"$eq":"."}}).include("repo","path","name","property.*")`
-
-	valuesByRepository := make(map[string][]string)
-	seenValues := make(map[string]map[string]struct{})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseUrl+"/artifactory/api/search/aql", strings.NewReader(rootFolderQuery))
+func (c *artifactoryClient) repositoryGroupValue(ctx context.Context, repositoryKey string) (string, error) {
+	metadataUrl := strings.ReplaceAll(c.metadataUrlTemplate, "{repo}", url.PathEscape(repositoryKey))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, metadataUrl, nil)
 	if err != nil {
-		return nil, err
+		return "", fmt.Errorf("create metadata request for repository %q: %w", repositoryKey, err)
 	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "text/plain")
-	c.setAuthentication(req)
+	req.Header.Set("Accept", "application/yaml, text/yaml, */*")
+	c.setMetadataAuthentication(req)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("request root folder properties: %w", err)
+		return "", fmt.Errorf("request metadata for repository %q: %w", repositoryKey, err)
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		return "", nil
 	}
 	if resp.StatusCode != http.StatusOK {
 		_, _ = io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
-		return nil, fmt.Errorf("root folder property query returned http %s", resp.Status)
+		return "", fmt.Errorf("metadata for repository %q returned http %s", repositoryKey, resp.Status)
 	}
 
 	body, readErr := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if readErr != nil {
-		return nil, fmt.Errorf("read root folder properties: %w", readErr)
+		return "", fmt.Errorf("read metadata for repository %q: %w", repositoryKey, readErr)
 	}
-	var result aqlSearchResult
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("decode root folder properties: %w", err)
+	var document map[string]any
+	if err := yaml.Unmarshal(body, &document); err != nil {
+		return "", fmt.Errorf("decode metadata for repository %q: %w", repositoryKey, err)
 	}
+	value := ""
+	if groupValue, exists := document[c.metadataGroupKey]; exists && groupValue != nil {
+		value = strings.TrimSpace(fmt.Sprint(groupValue))
+	}
+	return value, nil
+}
 
-	for _, folder := range result.Results {
-		for _, property := range folder.Properties {
-			if property.Key != c.propertyName || property.Value == "" {
-				continue
-			}
-			for _, value := range splitPropertyValues(property.Value) {
-				if seenValues[folder.Repository] == nil {
-					seenValues[folder.Repository] = make(map[string]struct{})
-				}
-				if _, exists := seenValues[folder.Repository][value]; exists {
-					continue
-				}
-				seenValues[folder.Repository][value] = struct{}{}
-				valuesByRepository[folder.Repository] = append(valuesByRepository[folder.Repository], value)
-			}
+func (c *artifactoryClient) metadataCacheRevision(ctx context.Context) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.metadataCacheVersionUrl, nil)
+	if err != nil {
+		return "", fmt.Errorf("create metadata cache version request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	c.setMetadataAuthentication(req)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("request metadata cache version: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return "", fmt.Errorf("metadata cache version returned http %s", resp.Status)
+	}
+	var document map[string]json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&document); err != nil {
+		return "", fmt.Errorf("decode metadata cache version: %w", err)
+	}
+	rawValue, exists := document[c.metadataCacheField]
+	if !exists {
+		return "", fmt.Errorf("metadata cache version document is missing field %q", c.metadataCacheField)
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(rawValue)))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return "", fmt.Errorf("decode metadata cache version field %q: %w", c.metadataCacheField, err)
+	}
+	switch typedValue := value.(type) {
+	case string:
+		if typedValue == "" {
+			return "", fmt.Errorf("metadata cache version field %q must not be empty", c.metadataCacheField)
+		}
+		return "string:" + typedValue, nil
+	case json.Number:
+		return "number:" + typedValue.String(), nil
+	case bool:
+		return fmt.Sprintf("boolean:%t", typedValue), nil
+	default:
+		return "", fmt.Errorf("metadata cache version field %q must be a string, number, or boolean", c.metadataCacheField)
+	}
+}
+
+func (c *artifactoryClient) repositoryGroupValues(ctx context.Context, repositories []repositorySummary) (map[string]string, error) {
+	valuesByRepository := make(map[string]string, len(repositories))
+	eligibleRepositories := uint64(0)
+	for _, repository := range repositories {
+		if repository.Type != "NA" {
+			eligibleRepositories++
 		}
 	}
+	if c.metadataCache == nil || !c.metadataCache.enabled {
+		if c.metadataCache != nil {
+			c.metadataCache.mu.Lock()
+			c.metadataCache.stats.repositoriesSeen += uint64(len(repositories))
+			c.metadataCache.stats.repositoriesEligible += eligibleRepositories
+			c.metadataCache.mu.Unlock()
+		}
+		for _, repository := range repositories {
+			if repository.Type == "NA" {
+				continue
+			}
+			if c.metadataCache != nil {
+				c.metadataCache.mu.Lock()
+				c.metadataCache.stats.metadataFetches++
+				c.metadataCache.mu.Unlock()
+			}
+			value, err := c.repositoryGroupValue(ctx, repository.Key)
+			if err != nil {
+				if c.metadataCache != nil {
+					c.metadataCache.mu.Lock()
+					c.metadataCache.stats.errors++
+					c.metadataCache.mu.Unlock()
+				}
+				return nil, err
+			}
+			if value != "" {
+				valuesByRepository[repository.Key] = value
+			}
+		}
+		if c.metadataCache != nil {
+			c.metadataCache.mu.Lock()
+			c.metadataCache.stats.ungroupedRepositories += eligibleRepositories - uint64(len(valuesByRepository))
+			c.metadataCache.mu.Unlock()
+		}
+		return valuesByRepository, nil
+	}
+
+	cache := c.metadataCache
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	cache.stats.repositoriesSeen += uint64(len(repositories))
+	cache.stats.repositoriesEligible += eligibleRepositories
+	cache.stats.versionChecks++
+	revision, err := c.metadataCacheRevision(ctx)
+	if err != nil {
+		cache.stats.errors++
+		return nil, err
+	}
+	revisionChanged := revision != cache.revision
+	groupValues := cache.values
+	if revisionChanged {
+		cache.stats.refreshes++
+		groupValues = make(map[string]string, len(repositories))
+	}
+	for _, repository := range repositories {
+		if repository.Type == "NA" {
+			continue
+		}
+		value, exists := groupValues[repository.Key]
+		if !exists {
+			cache.stats.misses++
+			cache.stats.metadataFetches++
+			value, err = c.repositoryGroupValue(ctx, repository.Key)
+			if err != nil {
+				cache.stats.errors++
+				return nil, err
+			}
+			groupValues[repository.Key] = value
+		} else {
+			cache.stats.hits++
+		}
+		if value != "" {
+			valuesByRepository[repository.Key] = value
+		}
+	}
+	if revisionChanged {
+		cache.values = groupValues
+		cache.revision = revision
+	}
+	cache.stats.ungroupedRepositories += eligibleRepositories - uint64(len(valuesByRepository))
 	return valuesByRepository, nil
 }
 
-func splitPropertyValues(value string) []string {
-	var values []string
-	for _, part := range strings.FieldsFunc(value, func(character rune) bool {
-		return character == ',' || character == ';'
-	}) {
-		part = trimNonAlphanumeric(part)
-		if part != "" {
-			values = append(values, part)
-		}
-	}
-	return values
-}
-
-func trimNonAlphanumeric(value string) string {
-	return strings.TrimFunc(value, func(character rune) bool {
-		return !unicode.IsLetter(character) && !unicode.IsDigit(character)
+func requestLoggingHandler(next http.Handler, clients []*artifactoryClient) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started := time.Now()
+		defer func() {
+			var totals repositoryCacheStats
+			enabledTargets := 0
+			for _, client := range clients {
+				if client.metadataCache == nil {
+					continue
+				}
+				client.metadataCache.mu.Lock()
+				if client.metadataCache.enabled {
+					enabledTargets++
+				}
+				totals.repositoriesSeen += client.metadataCache.stats.repositoriesSeen
+				totals.repositoriesEligible += client.metadataCache.stats.repositoriesEligible
+				totals.ungroupedRepositories += client.metadataCache.stats.ungroupedRepositories
+				totals.versionChecks += client.metadataCache.stats.versionChecks
+				totals.hits += client.metadataCache.stats.hits
+				totals.misses += client.metadataCache.stats.misses
+				totals.refreshes += client.metadataCache.stats.refreshes
+				totals.metadataFetches += client.metadataCache.stats.metadataFetches
+				totals.errors += client.metadataCache.stats.errors
+				client.metadataCache.mu.Unlock()
+			}
+			log.Printf("http request method=%q path=%q remote=%q duration=%s cache_enabled_targets=%d/%d repositories_seen_total=%d repositories_eligible_total=%d repositories_ungrouped_total=%d cache_version_checks_total=%d cache_hits_total=%d cache_misses_total=%d cache_refreshes_total=%d metadata_fetches_total=%d cache_errors_total=%d",
+				r.Method, r.URL.Path, r.RemoteAddr, time.Since(started), enabledTargets, len(clients),
+				totals.repositoriesSeen, totals.repositoriesEligible, totals.ungroupedRepositories,
+				totals.versionChecks, totals.hits, totals.misses, totals.refreshes, totals.metadataFetches, totals.errors)
+		}()
+		next.ServeHTTP(w, r)
 	})
 }
 
@@ -322,12 +562,12 @@ func newRepositoryCollector(clients []*artifactoryClient) *repositoryCollector {
 		clients: clients,
 		sizeDesc: prometheus.NewDesc(
 			metricName,
-			"Repository storage grouped by a root-folder property value, in bytes.",
+			"Repository storage grouped by a value from repository metadata yaml, in bytes.",
 			[]string{"server", propertyValueLabelName}, nil,
 		),
 		missingPropertySizeDesc: prometheus.NewDesc(
 			"artifactory_repository_size_missing_property_bytes",
-			"Total storage used by repositories without the configured root-folder property, in bytes.",
+			"Total storage used by repositories without the configured metadata value, in bytes.",
 			[]string{"server"}, nil,
 		),
 		specialRepositorySizeDesc: prometheus.NewDesc(
@@ -337,7 +577,7 @@ func newRepositoryCollector(clients []*artifactoryClient) *repositoryCollector {
 		),
 		upDesc: prometheus.NewDesc(
 			"artifactory_up",
-			"Whether the most recent Artifactory API requests succeeded.",
+			"Whether the most recent Artifactory and metadata requests succeeded.",
 			[]string{"server"}, nil,
 		),
 		scrapeTimeDesc: prometheus.NewDesc(
@@ -360,9 +600,9 @@ func (c *repositoryCollector) Collect(ch chan<- prometheus.Metric) {
 	for _, client := range c.clients {
 		now := time.Now()
 		repositories, err := client.repositorySizes(context.Background())
-		var propertyValues map[string][]string
+		var groupValuesByRepository map[string]string
 		if err == nil {
-			propertyValues, err = client.rootFolderPropertyValues(context.Background())
+			groupValuesByRepository, err = client.repositoryGroupValues(context.Background(), repositories)
 		}
 		up := 1.0
 		if err != nil {
@@ -389,14 +629,12 @@ func (c *repositoryCollector) Collect(ch chan<- prometheus.Metric) {
 				specialRepositorySizes[repository.Key] = size
 				continue
 			}
-			values := propertyValues[repository.Key]
-			if len(values) == 0 {
+			value := groupValuesByRepository[repository.Key]
+			if value == "" {
 				missingPropertySize += size
 				continue
 			}
-			for _, value := range values {
-				groupSizes[value] += size
-			}
+			groupSizes[value] += size
 		}
 		specialRepositoryKeys := make([]string, 0, len(specialRepositorySizes))
 		for repositoryKey := range specialRepositorySizes {
